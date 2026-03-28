@@ -1,0 +1,402 @@
+# -*- coding: utf-8 -*-
+"""
+Prognozowanie — metody bezpośrednie i przez składniki (HW, ARIMA, SARIMA)
+Dane: Ropa, Wegiel, Gaz_ziemny, PGE, Orlen, Enea, Tauron
+Autor: Piotr Łukowski, Oskar Kanigowski, Tomasz Kotliński
+"""
+
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+import statsmodels.api as sm
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from matplotlib import dates as mdates
+
+# display() poza notebookiem
+try:
+    from IPython.display import display
+except Exception:
+    def display(x): print(x)
+
+plt.rcParams["figure.figsize"] = (10, 5)
+
+# ============= USTAWIENIA =============
+USE_AUTOARIMA = False  # True => wymaga pmdarima
+STEPS_AHEAD   = 24     # horyzont walidacyjny (miesiące) train/test
+H_FINAL       = 24     # horyzont ex-ante (miesiące)
+INVERT_Y      = False  # jeśli chcesz odwrócić oś Y na wykresach
+
+# ============= WCZYTANIE =============
+def load_input_excel(preferred_paths=None):
+    if preferred_paths is None:
+        preferred_paths = [
+            "/content/ZP4.xlsx",
+            "/mnt/data/ZP4.xlsx",
+            "ZP4.xlsx"
+        ]
+    for p in preferred_paths:
+        if os.path.exists(p):
+            print("🔎 Wczytano plik:", p)
+            return pd.read_excel(p, sheet_name=0)
+    try:
+        from google.colab import files
+        print("Plik nie znaleziony w standardowych ścieżkach. Wgraj plik (np. ZP4.xlsx).")
+        uploaded = files.upload()
+        if uploaded:
+            name = list(uploaded.keys())[0]
+            print("🔎 Wczytano plik (upload):", name)
+            return pd.read_excel(name, sheet_name=0)
+    except Exception:
+        pass
+    raise FileNotFoundError("Nie znalazłem pliku Excel. Umieść go w /content lub /mnt/data albo użyj uploadu w Colab.")
+
+df_raw = load_input_excel()
+df_raw.columns = [c.strip().lower().replace(" ", "_") for c in df_raw.columns]
+
+# kolumna daty
+date_cols = [c for c in df_raw.columns if c in ("data", "date") or "data" in c or "date" in c]
+if not date_cols:
+    raise ValueError("Nie znalazłem kolumny z datą (szukam 'Data' lub podobnej).")
+date_col = date_cols[0]
+num_cols = [c for c in df_raw.columns if c != date_col]
+
+# daty i freq
+df_raw[date_col] = pd.to_datetime(df_raw[date_col], errors="coerce")
+if df_raw[date_col].isna().any():
+    raise ValueError("Kilka wartości w kolumnie Data nie dało się skonwertować do daty.")
+df = df_raw.set_index(date_col).sort_index()
+
+df.index = pd.DatetimeIndex(df.index)
+try:
+    df.index.freq = pd.infer_freq(df.index)
+except Exception:
+    df.index.freq = None
+if df.index.freq is None or str(df.index.freq).upper().startswith("A") or "D" in str(df.index.freq).upper():
+    df = df.asfreq("MS")
+    df.index.freq = "MS"
+
+# liczby (przecinek->kropka) i imputacja
+df[num_cols] = df[num_cols].apply(
+    lambda x: pd.to_numeric(x.astype(str).str.replace(",", ".").str.replace(" ", ""), errors="coerce")
+)
+df = df.fillna(df.mean())
+
+print("📅 Zakres danych:", df.index.min().date(), "-", df.index.max().date())
+print("📊 Kolumny:", list(df.columns))
+print("🔢 Liczba obserwacji:", len(df))
+
+ax = df.plot(title="Zmienne diagnostyczne – sektor energetyczny (miesięczne)")
+if INVERT_Y: ax.invert_yaxis()
+plt.grid(alpha=0.3); plt.show()
+
+# ============= SKALOWANIE I INDEKSY =============
+scaler_std = StandardScaler()
+df_std = pd.DataFrame(scaler_std.fit_transform(df), columns=df.columns, index=df.index)
+
+scaler_min = MinMaxScaler()
+df_norm = pd.DataFrame(scaler_min.fit_transform(df), columns=df.columns, index=df.index)
+
+# Indeksy
+idx_ew = df_std.mean(axis=1)
+
+pca = PCA(n_components=1)
+idx_pca = pd.Series(pca.fit_transform(df_std).flatten(), index=df.index)
+
+P = df_norm / (df_norm.sum(axis=0) + 1e-12)
+P = P.replace(0, 1e-12)
+E = (-P * np.log(P)).mean(axis=0) / np.log(len(df))
+d = 1 - E
+wagi = d / d.sum()
+idx_ewm = (df_norm * wagi).sum(axis=1)
+
+print("\n📈 Wagi EWM:")
+print(wagi.round(4))
+
+ax = plt.gca()
+plt.plot(idx_ew, label="EW")
+plt.plot(idx_pca, label="PCA")
+plt.plot(idx_ewm, label="EWM")
+if INVERT_Y: ax.invert_yaxis()
+plt.title("POTWREG (miesięczne)"); plt.legend(); plt.grid(alpha=0.3); plt.show()
+
+# ============= TRAIN/TEST =============
+n = len(df)
+steps_ahead = STEPS_AHEAD
+if n <= steps_ahead:
+    raise ValueError("Za mało obserwacji w danych w stosunku do horyzontu prognozy.")
+train_slice = slice(0, n - steps_ahead)
+test_slice  = slice(n - steps_ahead, n)
+
+# ============= METRYKI =============
+def eval_metrics(actual, pred):
+    actual = np.asarray(actual); pred = np.asarray(pred)
+    me = np.mean(pred - actual)
+    mae = np.mean(np.abs(pred - actual))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mape = 100 * np.nanmean(np.where(np.abs(actual) > 1e-8, np.abs((pred - actual) / actual), np.nan))
+    rmse = np.sqrt(np.mean((pred - actual) ** 2))
+    rmspe = 100 * (rmse / np.mean(np.abs(actual))) if np.mean(np.abs(actual)) > 1e-8 else np.nan
+    theil = np.nan
+    try:
+        theil = np.sqrt(np.mean(((pred[1:] - actual[1:]) ** 2)) / np.mean(actual[1:] ** 2))
+    except Exception:
+        pass
+    return {"ME": me, "MAE": mae, "MAPE": mape, "RMSE": rmse, "RMSPE": rmspe, "Theil": theil}
+
+# ============= NARZĘDZIA MODELOWE =============
+def fit_hw(y_train, h):
+    m = ExponentialSmoothing(y_train, trend="add", seasonal=None).fit()
+    fc = m.forecast(h)
+    return {"name": "HW", "model": m, "fc": fc, "fitted": m.fittedvalues, "orders": None}
+
+def fit_arima(y_train, h, order=(1,1,1)):
+    m = SARIMAX(y_train, order=order, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    res = m.get_forecast(steps=h)
+    fc = res.predicted_mean
+    conf = res.conf_int(alpha=0.05)
+    return {"name": f"ARIMA{order}", "model": m, "fc": fc, "fitted": m.fittedvalues, "conf": conf, "orders": ("ARIMA", order, None)}
+
+def fit_sarima(y_train, h, order=(1,1,1), seasonal_order=(1,1,1,12)):
+    m = SARIMAX(y_train, order=order, seasonal_order=seasonal_order,
+                enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    res = m.get_forecast(steps=h)
+    fc = res.predicted_mean
+    conf = res.conf_int(alpha=0.05)
+    return {"name": f"SARIMA{order}x{seasonal_order}", "model": m, "fc": fc, "fitted": m.fittedvalues, "conf": conf, "orders": ("SARIMA", order, seasonal_order)}
+
+def fit_autoarima(y_train, h):
+    from pmdarima import auto_arima
+    aa = auto_arima(
+        y_train, start_p=0, start_q=0, max_p=3, max_q=3,
+        start_P=0, start_Q=0, max_P=2, max_Q=2, seasonal=True, m=12,
+        max_d=2, max_D=1, information_criterion="aicc", stepwise=True,
+        with_intercept=True, trace=False, error_action="ignore", suppress_warnings=True
+    )
+    fc = pd.Series(aa.predict(n_periods=h), index=pd.date_range(y_train.index[-1] + pd.offsets.MonthBegin(1), periods=h, freq="MS"))
+    # do PI dopasujemy SARIMAX na tych samych rzędach
+    try:
+        m = SARIMAX(y_train, order=aa.order, seasonal_order=aa.seasonal_order,
+                    enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+        res = m.get_forecast(steps=h)
+        conf = res.conf_int(alpha=0.05)
+        fitted = m.fittedvalues
+        return {"name": f"AUTOARIMA{aa.order}x{aa.seasonal_order}", "model": m, "fc": fc, "fitted": fitted, "conf": conf, "orders": ("SARIMA", aa.order, aa.seasonal_order)}
+    except Exception:
+        return {"name": f"AUTOARIMA{aa.order}x{aa.seasonal_order}", "model": aa, "fc": fc, "fitted": None, "orders": ("AUTOARIMA", aa.order, aa.seasonal_order)}
+
+# ============= PODEJŚCIE 1: PROGNOZA BEZPOŚREDNIA INDEKSÓW =============
+print("\n=== PODEJŚCIE 1: PROGNOZA BEZPOŚREDNIA (HW / ARIMA / SARIMA{} ) ===".format(" / AUTOARIMA" if USE_AUTOARIMA else ""))
+direct_rows = []
+
+indexes_direct = {"EW": idx_ew, "PCA": idx_pca, "EWM": idx_ewm}
+for name, idx in indexes_direct.items():
+    y_train = idx.iloc[train_slice]
+    y_test  = idx.iloc[test_slice]
+    h = len(y_test)
+
+    cand = []
+    cand.append(fit_hw(y_train, h))
+    cand.append(fit_arima(y_train, h, order=(1,1,1)))
+    cand.append(fit_sarima(y_train, h, order=(1,1,1), seasonal_order=(1,1,1,12)))
+    if USE_AUTOARIMA:
+        try:
+            cand.append(fit_autoarima(y_train, h))
+        except Exception:
+            pass
+
+    # metryki i wykres
+    plt.figure(figsize=(10,4))
+    ax = plt.gca()
+    plt.plot(idx, label="obserwacje", lw=1)
+    if INVERT_Y: ax.invert_yaxis()
+
+    for c in cand:
+        fc = c["fc"].reindex(y_test.index)
+        m = eval_metrics(y_test.values, fc.values)
+        s = pd.Series(m, name=f"{name} — {c['name']}")
+        direct_rows.append(s)
+
+        ls = "--" if "ARIMA" in c["name"] and "SARIMA" not in c["name"] else (":" if "SARIMA" in c["name"] else "-.")
+        plt.plot(y_test.index, fc, ls, label=c["name"])
+        if c.get("conf") is not None:
+            conf = c["conf"]
+            plt.fill_between(y_test.index, conf.iloc[:,0], conf.iloc[:,1], alpha=0.12, label=f"PI 95% {c['name']}")
+
+    plt.title(f"POTWREG ({name}) — prognoza bezpośrednia")
+    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout(); plt.show()
+
+direct_df = pd.DataFrame(direct_rows).round(3)
+print("▶️ Wyniki (bezpośrednie):")
+display(direct_df.sort_values(["RMSE","MAPE","RMSPE"]))
+
+# ============= PODEJŚCIE 2: PROGNOZA PRZEZ SKŁADNIKI (HW/ARIMA/SARIMA/AUTOARIMA) =============
+print("\n=== PODEJŚCIE 2: PROGNOZA SKŁADNIKÓW I AGREGACJA ===")
+df_train = df.iloc[train_slice]
+df_test  = df.iloc[test_slice]
+h = len(df_test)
+
+pred_components = pd.DataFrame(index=df_test.index)
+component_choice = {}     # nazwa wybranego modelu
+component_orders = {}     # zapamiętane rzędy (dla ex-ante)
+component_metrics = {}
+
+for col in df.columns:
+    ytr = df_train[col].dropna()
+    if len(ytr) < 6:
+        # fallback: wartość ostatnia
+        last = ytr.iloc[-1] if len(ytr) else 0.0
+        fc = pd.Series([last]*h, index=df_test.index)
+        pred_components[col] = fc
+        component_choice[col] = "Fallback-last"
+        component_orders[col] = None
+        component_metrics[col] = {"RMSE": np.nan, "MAPE": np.nan, "RMSPE": np.nan}
+        continue
+
+    # Kandydaci
+    C = []
+    C.append(fit_hw(ytr, h))
+    C.append(fit_arima(ytr, h, order=(1,1,1)))
+    C.append(fit_sarima(ytr, h, order=(1,1,1), seasonal_order=(1,1,1,12)))
+    if USE_AUTOARIMA:
+        try:
+            C.append(fit_autoarima(ytr, h))
+        except Exception:
+            pass
+
+    # Ocena na zbiorze testowym (h-krokowa prognoza out-of-sample)
+    best_name, best_fc, best_orders, best_rmse = None, None, None, np.inf
+    for c in C:
+        fc = c["fc"].reindex(df_test.index)
+        m = eval_metrics(df_test[col].values, fc.values)
+        rmse = m["RMSE"]
+        # zapisz metryki kandydata (opcjonalnie)
+        # wybierz najlepszy po RMSE
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_name = c["name"]
+            best_fc = fc
+            best_orders = c.get("orders", None)
+
+    pred_components[col] = best_fc
+    component_choice[col] = best_name
+    component_orders[col] = best_orders
+    # policz końcowe metryki dla zwycięzcy
+    component_metrics[col] = {k: round(v, 3) if v is not None else np.nan for k, v in eval_metrics(df_test[col].values, best_fc.values).items()}
+
+print("\nWybrane modele (składniki):")
+for k, v in component_choice.items():
+    print(f" - {k}: {v}")
+print("\nMetryki zwycięzców (na zbiorze testowym):")
+display(pd.DataFrame(component_metrics).T)
+
+# Agregacja do indeksów
+pred_std = pd.DataFrame(scaler_std.transform(pred_components), columns=df.columns, index=df_test.index)
+pred_norm = pd.DataFrame(scaler_min.transform(pred_components), columns=df.columns, index=df_test.index)
+
+idx_pred_ew  = pred_std.mean(axis=1)
+idx_pred_pca = pd.Series(pca.transform(pred_std).flatten(), index=df_test.index)
+idx_pred_ewm = (pred_norm * wagi).sum(axis=1)
+
+# Rzeczywiste indeksy na teście
+test_std = pd.DataFrame(scaler_std.transform(df_test), columns=df.columns, index=df_test.index)
+idx_real_ew  = test_std.mean(axis=1)
+idx_real_pca = pd.Series(pca.transform(test_std).flatten(), index=df_test.index)
+test_norm    = pd.DataFrame(scaler_min.transform(df_test), columns=df.columns, index=df_test.index)
+idx_real_ewm = (test_norm * wagi).sum(axis=1)
+
+indexes_full = {"EW": idx_ew, "PCA": idx_pca, "EWM": idx_ewm}
+
+# Metryki agregowane i wykresy
+agg_metrics = {}
+for n, p, a in zip(["EW","PCA","EWM"], [idx_pred_ew, idx_pred_pca, idx_pred_ewm], [idx_real_ew, idx_real_pca, idx_real_ewm]):
+    agg_metrics[f"{n} (agg)"] = eval_metrics(a.values, p.values)
+
+    plt.figure()
+    ax = plt.gca()
+    plt.plot(indexes_full[n], label="rzeczywisty (pełny okres)", lw=1)
+    plt.plot(a.index, a, "b-", label="rzeczywisty (test)", lw=1)
+    plt.plot(p.index, p, "r--", label="prognoza (agregowana)", lw=1)
+    if INVERT_Y: ax.invert_yaxis()
+    plt.title(f"Prognoza przez składniki – POTWREG ({n})")
+    plt.legend(); plt.grid(alpha=0.3); plt.show()
+
+agg_df = pd.DataFrame(agg_metrics).T.round(3)
+print("▶️ Wyniki (agregowane, składniki→indeksy):")
+display(agg_df)
+
+# ============= PORÓWNANIE PODEJŚĆ =============
+print("\n=== PORÓWNANIE PODEJŚĆ (bezpośrednie vs. agregacja) ===")
+comparison = pd.concat([direct_df, agg_df])
+display(comparison)
+
+# ============= EX-ANTE: refit NA CAŁYM OKRESIE =============
+print("\n=== PROGNOZA KOŃCOWA EX-ANTE (refit na całym szeregu) ===")
+last_date = idx_ew.index[-1]
+fc_index = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=H_FINAL, freq="MS")
+
+# 1) EX-ANTE PRZEZ SKŁADNIKI — refit każdy składnik najlepszym typem modelu
+def refit_and_forecast_component(series, orders_info, h):
+    """Refit komponentu na CAŁYM szeregu danym typem wybranym w walidacji."""
+    name = component_choice[series.name]
+    s = series.dropna()
+    if orders_info is None or name == "HW":
+        m = ExponentialSmoothing(s, trend="add", seasonal=None).fit()
+        return pd.Series(m.forecast(h).values, index=fc_index), ("HW", None, None)
+    kind, order, seasonal_order = orders_info if orders_info is not None else ("HW", None, None)
+    if kind == "ARIMA":
+        m = SARIMAX(s, order=order, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+        return pd.Series(m.forecast(h).values, index=fc_index), ("ARIMA", order, None)
+    elif kind == "SARIMA" or kind == "AUTOARIMA":
+        # AUTOARIMA została zmapowana na SARIMAX dla PI, więc traktujemy jak SARIMA
+        seas = seasonal_order if seasonal_order is not None else (0,0,0,0)
+        m = SARIMAX(s, order=order, seasonal_order=seas, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+        return pd.Series(m.forecast(h).values, index=fc_index), ("SARIMA", order, seas)
+    else:
+        # bezpieczny fallback
+        last = s.iloc[-1] if len(s) else 0.0
+        return pd.Series([last]*h, index=fc_index), ("Fallback", None, None)
+
+ex_ante_components = []
+for col in df.columns:
+    fc_col, used = refit_and_forecast_component(df[col], component_orders.get(col), H_FINAL)
+    fc_col.name = col
+    ex_ante_components.append(fc_col)
+ex_ante_components = pd.concat(ex_ante_components, axis=1)
+
+# Agregacja ex-ante do indeksów
+ex_norm = pd.DataFrame(scaler_min.transform(ex_ante_components), columns=df.columns, index=fc_index)
+ex_std  = pd.DataFrame(scaler_std.transform(ex_ante_components), columns=df.columns, index=fc_index)
+
+fc_ex_ew  = ex_std.mean(axis=1).rename("EW_final")
+fc_ex_pca = pd.Series(pca.transform(ex_std).flatten(), index=fc_index, name="PCA_final")
+fc_ex_ewm = (ex_norm * wagi).sum(axis=1).rename("EWM_final")
+
+final_ex_ante = pd.concat([fc_ex_ew, fc_ex_pca, fc_ex_ewm], axis=1)
+print("Prognoza ex-ante (miesięczna) — indeksy z prognoz składników:")
+display(final_ex_ante.round(4))
+
+def _plot_final(series, fc, title):
+    fig, ax = plt.subplots(figsize=(11,4))
+    ax.plot(series.index, series.values, lw=1, label="obserwacje (pełny okres)")
+    ax.plot(fc.index, fc.values, "r--o", lw=1, label="prognoza ex-ante")
+    ax.axvspan(fc.index[0], fc.index[-1], color="gray", alpha=0.12)
+    ax.set_xlim(series.index.min(), fc.index[-1])
+    ax.xaxis.set_major_locator(mdates.YearLocator(1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    if INVERT_Y: ax.invert_yaxis()
+    plt.xticks(rotation=45)
+    ax.set_title(title)
+    ax.legend(); ax.grid(alpha=0.3); plt.tight_layout(); plt.show()
+
+_plot_final(idx_ew,  fc_ex_ew,  "POTWREG (EW) — ex-ante przez składniki")
+_plot_final(idx_pca, fc_ex_pca, "POTWREG (PCA) — ex-ante przez składniki")
+_plot_final(idx_ewm, fc_ex_ewm, "POTWREG (EWM) — ex-ante przez składniki")
+
+print("Gotowe. Porównaj tabele metryk: direct_df (bezpośrednie) kontra agg_df (przez składniki).")
