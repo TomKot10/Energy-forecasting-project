@@ -42,4 +42,4 @@ Models were evaluated using standard metrics such as RMSE, MAE, MAPE, and RMSPE 
 - Git / GitHub
 
 ## Authors
-This project was developed as a team project by three contributors as part of an academic assignment focused on practical applications of time series forecasting.
+Tomasz Kotliński, Piotr Łukowski
